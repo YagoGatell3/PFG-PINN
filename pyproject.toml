@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+requires-python = ">=3.12,<3.14"
+name = "src"
+version = "0.1.0"
+description = "Python Template"
+readme = "README.md"
+dependencies = [
+    "numpy<2",
+    "pandas",
+    "highspy",
+    "torch<=2.2.2",
+    "matplotlib",
+    "scipy"
+]
+
+[dependency-groups]
+dev = ["colorama", "pytest", "ruff"]
+
+[project.scripts]
+main = "src.main:main"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "UP",
+    "B",
+    "SIM",
+    "I",
+    "C4",
+    "PTH",
+    "A",
+    "RET",
+    "PLW",
+    "PLE",
+    "PERF",
+    "SLF",
+    "PD",
+]
+ignore = ["E501"]
+
+fixable = ["ALL"]
+unfixable = []
+
+dummy-variable-rgx = "^(_+|(_+[a-z_A-Z0-9_]*[a-z_A-Z0-9_]+?))$"
+
+[tool.ruff.lint.mccabe]
+
+max-complexity = 10
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["D401"]
+"tests/*.py" = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+minversion = "8"
+testpaths = ["tests"]
+log_cli_level = "INFO"
+xfail_strict = true
+addopts = ["-ra", "--strict-config", "--strict-markers", "--color=yes"]
+filterwarnings = ["error", "ignore::DeprecationWarning"]
+
+[tool.uv.workspace]
+members = ["python-template"]
