@@ -14,7 +14,8 @@ dependencies = [
     "highspy",
     "torch<=2.2.2",
     "matplotlib",
-    "scipy"
+    "scipy",
+    "seaborn"
 ]
 
 [dependency-groups]
