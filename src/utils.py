@@ -131,6 +131,7 @@ def plot_and_save_results(
     n: int = 0,
     save_dir: str = "../img",
     sistema: str = "qho",
+    label: str = "PINN",
 ):
     """
     Genera y guarda la gráfica del estado actual de la predicción de la PINN,
@@ -217,7 +218,7 @@ def plot_and_save_results(
     plt.tight_layout()
 
     # Guardar la figura
-    nombre_archivo = f"epoch_{epoch:05d}.png"
+    nombre_archivo = f"{label}_epoch_{epoch:05d}.png"
     ruta_completa = os.path.join(ruta_directorio, nombre_archivo)
     plt.savefig(ruta_completa, dpi=300)
     plt.close()
@@ -318,24 +319,15 @@ def measure_numerical_reference(
             method = "Crank-Nicolson"
 
         elif sistema == "heat_inverse":
-            # Para el calor usamos la solución analítica de Fourier
-            # que ya tenemos en exact_solutions — no necesita método numérico
-            # pero medimos su tiempo igualmente para la comparativa
-            import torch
+            from src.numerical_methods import solve_heat_crank_nicolson
 
-            from src.exact_solutions import heat_exact
-
-            x_t = torch.tensor(x_or_t, dtype=torch.float32).unsqueeze(1)
             t_arr = kwargs.get("t_array", np.linspace(0, 1, 100))
             alpha = kwargs.get("alpha", 0.1)
-            L = kwargs.get("L", 1.0)
-            # Evaluamos en todos los instantes temporales
-            results = []
-            for t_val in t_arr:
-                t_t = torch.full_like(x_t, t_val)
-                results.append(heat_exact(x_t, t_t, alpha=alpha, L=L).numpy())
-            solution = np.array(results)
-            method = "Serie de Fourier (Analítica)"
+            L     = kwargs.get("L", 1.0)
+            solution = solve_heat_crank_nicolson(
+                x=x_or_t, t=t_arr, alpha=alpha, L=L,
+            )
+            method = "Crank-Nicolson"
 
         else:
             raise ValueError(
@@ -353,8 +345,144 @@ def measure_numerical_reference(
 
 def get_device() -> torch.device:
     """Detecta automáticamente si hay GPU disponible."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     print(f"Usando dispositivo: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     return device
+
+def plot_comparison(
+    x_eval: torch.Tensor,
+    u_true: torch.Tensor,
+    pred_pinn: torch.Tensor,
+    pred_nn: torch.Tensor,
+    pred_numerical: torch.Tensor,
+    error_pinn: float,
+    error_nn: float,
+    error_numerical: float,
+    numerical_label: str,
+    sistema: str,
+    x_train: torch.Tensor = None,
+    train_region_end: float = None,
+    save_dir: str = "img",
+    estado_n: int = 0,
+):
+    """
+    Gráfica comparativa final: solución analítica vs método numérico vs NN pura vs PINN.
+    Genérica para todos los sistemas físicos del proyecto.
+
+    Args:
+        x_eval:          Puntos de evaluación (eje x o t).
+        u_true:          Solución analítica/exacta de referencia.
+        pred_pinn:       Predicción de la PINN.
+        pred_nn:         Predicción de la NN pura (sin física).
+        pred_numerical:  Solución del método numérico clásico.
+        error_pinn:      Error L2 de la PINN.
+        error_nn:        Error L2 de la NN pura.
+        error_numerical: Error L2 del método numérico.
+        numerical_label: Nombre del método numérico (e.g. 'RK4', 'FDM').
+        sistema:         Identificador del sistema físico.
+        x_train:         Puntos de entrenamiento (opcional, para marcar zona).
+        train_region_end: Fin de la zona de entrenamiento (opcional, para axvspan).
+        save_dir:        Directorio raíz de imágenes.
+        estado_n:        Estado cuántico (0 para sistemas clásicos).
+    """
+    ruta = os.path.join(save_dir, sistema, f"estado_{estado_n}")
+    os.makedirs(ruta, exist_ok=True)
+
+    x_np      = x_eval.detach().numpy().flatten()
+    u_true_np = u_true.detach().numpy().flatten()
+    pinn_np   = pred_pinn.detach().numpy().flatten()
+    nn_np     = pred_nn.detach().numpy().flatten()
+    num_np    = pred_numerical.detach().numpy().flatten()
+
+    # Etiquetas de ejes según sistema
+    etiquetas = {
+        "oscilador_clasico": ("t (Tiempo)", "u(t) (Posición)"),
+        "pendulo_inverso":   ("t (Tiempo)", "θ(t) (Ángulo)"),
+        "qho":               ("x (Posición)", "ψ(x) (Función de onda)"),
+        "pozo_infinito":     ("x (Posición)", "ψ(x) (Función de onda)"),
+        "heat_inverse":      ("x (Posición)", "u(x,t)"),
+    }
+    xlabel, ylabel = etiquetas.get(sistema, ("Entrada", "Salida"))
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+
+    ax.plot(x_np, u_true_np, label="Solución analítica",
+            color="blue", linewidth=2, alpha=0.6)
+    ax.plot(x_np, num_np,  label=f"{numerical_label} (L2={error_numerical:.2e})",
+            color="green",  linewidth=1.5, linestyle="--")
+    ax.plot(x_np, nn_np,   label=f"NN pura (L2={error_nn:.2e})",
+            color="orange", linewidth=1.5, linestyle="-.")
+    ax.plot(x_np, pinn_np, label=f"PINN (L2={error_pinn:.2e})",
+            color="red",    linewidth=1.5, linestyle=":")
+
+    if train_region_end is not None:
+        ax.axvspan(x_np[0], train_region_end, alpha=0.08,
+                   color="gray", label="Zona de entrenamiento")
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(f"{sistema.replace('_', ' ').title()} — Comparativa: Analítica vs {numerical_label} vs NN vs PINN")
+    ax.legend(loc="upper right")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    ruta_completa = os.path.join(ruta, "comparativa_final.png")
+    plt.savefig(ruta_completa, dpi=150)
+    plt.close()
+    print(f"Gráfica comparativa guardada en: {ruta_completa}")
+    
+    
+def update_dynamic_weights_tunnel(
+    ic_loss: torch.Tensor,
+    ph_loss: torch.Tensor,
+    bc_loss: torch.Tensor,
+    norm_loss: torch.Tensor,
+    data_loss: torch.Tensor,
+    last_layer_weight: torch.nn.Parameter,
+    current_lambda_ph: float,
+    current_lambda_bc: float,
+    current_lambda_norm: float,
+    current_lambda_data: float,
+    alpha: float = 0.9,
+    lambda_min: float = 0.1,
+    lambda_max: float = 50.0,
+) -> tuple[float, float, float, float]:
+    """
+    Pesos dinámicos para el efecto túnel.
+    La IC actúa como pérdida de referencia para calibrar el resto.
+    Los pesos se clipean en [lambda_min, lambda_max] para evitar
+    amplificaciones descontroladas.
+    """
+    grad_ic = torch.autograd.grad(
+        ic_loss, last_layer_weight, retain_graph=True, allow_unused=True
+    )[0]
+
+    if grad_ic is None:
+        return current_lambda_ph, current_lambda_bc, current_lambda_norm, current_lambda_data
+
+    max_grad_ic = torch.max(torch.abs(grad_ic))
+
+    def _update(loss, current_lambda):
+        grad = torch.autograd.grad(
+            loss, last_layer_weight, retain_graph=True, allow_unused=True
+        )[0]
+        if grad is None:
+            return current_lambda
+        mean_grad  = torch.mean(torch.abs(grad)) + 1e-8
+        hat_lambda = max_grad_ic / mean_grad
+        new_lambda = (1 - alpha) * current_lambda + alpha * hat_lambda.item()
+        return float(np.clip(new_lambda, lambda_min, lambda_max))
+
+    new_lambda_ph   = _update(ph_loss,   current_lambda_ph)
+    new_lambda_bc   = _update(bc_loss,   current_lambda_bc)
+    new_lambda_norm = _update(norm_loss, current_lambda_norm)
+    new_lambda_data = (
+        _update(data_loss, current_lambda_data)
+        if data_loss.item() > 0.0
+        else current_lambda_data
+    )
+
+    return new_lambda_ph, new_lambda_bc, new_lambda_norm, new_lambda_data

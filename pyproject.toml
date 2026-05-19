@@ -11,11 +11,11 @@ readme = "README.md"
 dependencies = [
     "numpy<2",
     "pandas",
-    "highspy",
-    "torch<=2.2.2",
+    "torch<=2.5.1",
     "matplotlib",
     "scipy",
-    "seaborn"
+    "seaborn",
+    "black"
 ]
 
 [dependency-groups]
@@ -82,3 +82,11 @@ filterwarnings = ["error", "ignore::DeprecationWarning"]
 
 [tool.uv.workspace]
 members = ["python-template"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true

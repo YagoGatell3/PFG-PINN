@@ -1,77 +1,479 @@
 import os
+
 import numpy as np
 import torch
 import torch.optim as optim
+from scipy.stats import qmc
 
-from src.models import PINNTunnel
 from src.loss_functions import (
-    physics_loss_tunnel,
-    initial_condition_loss_tunnel,
     boundary_loss_tunnel,
+    data_loss_tunnel,
+    initial_condition_loss_tunnel,
     normalization_loss_tunnel,
+    physics_loss_tunnel,
 )
-from src.exact_solutions import psi_tunnel_initial
-from src.numerical_methods import solve_tunnel_crank_nicolson
-from src.samplers import generate_lhs_points, generate_grid_points
-from src.utils import set_seed, calculate_l2_error, save_experiment_results, Timer, measure_numerical_reference
+from src.models import PINNTunnel
+from src.utils import (
+    Timer,
+    calculate_l2_error,
+    measure_numerical_reference,
+    save_experiment_results,
+    set_seed,
+    update_dynamic_weights_tunnel,
+)
 
+
+# ── Device ────────────────────────────────────────────────────────────────────
+
+def get_device() -> torch.device:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Device] Usando: {device}")
+    return device
+
+
+# ── Sampler 2D ────────────────────────────────────────────────────────────────
 
 def sample_collocation_2d(
-    x_min, x_max, t_min, t_max, n_points
+    x_min: float,
+    x_max: float,
+    t_min: float,
+    t_max: float,
+    n_points: int,
+    sampler: str = "lhs",
+    device: torch.device = torch.device("cpu"),
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Muestrea puntos (x, t) con LHS en el dominio 2D."""
-    from scipy.stats import qmc
-    sampler = qmc.LatinHypercube(d=2)
-    pts = sampler.random(n=n_points)
-    pts[:, 0] = x_min + pts[:, 0] * (x_max - x_min)
-    pts[:, 1] = t_min + pts[:, 1] * (t_max - t_min)
-    x = torch.tensor(pts[:, 0:1], dtype=torch.float32, requires_grad=True)
-    t = torch.tensor(pts[:, 1:2], dtype=torch.float32, requires_grad=True)
+    """Muestrea puntos (x, t) en el dominio 2D."""
+    if sampler == "lhs":
+        engine = qmc.LatinHypercube(d=2)
+        pts    = engine.random(n=n_points)
+        pts[:, 0] = x_min + pts[:, 0] * (x_max - x_min)
+        pts[:, 1] = t_min + pts[:, 1] * (t_max - t_min)
+    else:
+        nx = int(np.sqrt(n_points))
+        nt = nx
+        xv, tv = np.meshgrid(
+            np.linspace(x_min, x_max, nx),
+            np.linspace(t_min, t_max, nt),
+        )
+        pts = np.stack([xv.ravel(), tv.ravel()], axis=1)
+
+    x = torch.tensor(pts[:, 0:1], dtype=torch.float32,
+                     requires_grad=True, device=device)
+    t = torch.tensor(pts[:, 1:2], dtype=torch.float32,
+                     requires_grad=True, device=device)
     return x, t
 
 
-def plot_tunnel_results(model, x_eval, t_snapshots, prob_cn, epoch, loss, save_dir):
-    """
-    Compara densidad de probabilidad PINN vs Crank-Nicolson
-    en varios instantes temporales.
-    """
+# ── Plots ─────────────────────────────────────────────────────────────────────
+
+def _plot_tunnel_results(
+    model_pinn: torch.nn.Module,
+    model_nn: torch.nn.Module,
+    x_eval: torch.Tensor,
+    t_snap_vals: list,
+    prob_cn_snaps: list,
+    x_barrier_left: float,
+    x_barrier_right: float,
+    epoch: int,
+    loss: float,
+    save_dir: str,
+    filename: str = None,
+):
+    """Compara |Ψ|² de PINN, NN pura y Crank-Nicolson en varios instantes."""
     import matplotlib.pyplot as plt
 
-    n_snaps = len(t_snapshots)
-    fig, axes = plt.subplots(n_snaps, 1, figsize=(10, 3 * n_snaps))
+    n_snaps  = len(t_snap_vals)
+    fig, axes = plt.subplots(1, n_snaps, figsize=(5 * n_snaps, 4), sharey=False)
     if n_snaps == 1:
         axes = [axes]
 
-    x_np = x_eval.detach().numpy().flatten()
+    x_np   = x_eval.cpu().detach().numpy().flatten()
+    device = x_eval.device
 
-    for i, t_val in enumerate(t_snapshots):
-        t_tensor = torch.full((len(x_eval), 1), t_val)
+    for i, t_val in enumerate(t_snap_vals):
+        t_tensor = torch.full((len(x_eval), 1), t_val, device=device)
         with torch.no_grad():
-            u, v = model(x_eval, t_tensor)
-        prob_pinn = (u**2 + v**2).numpy().flatten()
+            u_p, v_p = model_pinn(x_eval, t_tensor)
+            u_n, v_n = model_nn(x_eval,   t_tensor)
 
-        axes[i].plot(x_np, prob_cn[i], label="Crank-Nicolson", color="blue", alpha=0.7)
-        axes[i].plot(x_np, prob_pinn, label="PINN", linestyle="--", color="black")
-        axes[i].axvspan(0.5, 1.5, alpha=0.15, color="red", label="Barrera V₀")
-        axes[i].set_title(f"t = {t_val:.2f}")
+        prob_pinn = (u_p ** 2 + v_p ** 2).cpu().numpy().flatten()
+        prob_nn   = (u_n ** 2 + v_n ** 2).cpu().numpy().flatten()
+
+        axes[i].plot(x_np, prob_cn_snaps[i],
+                     label="Crank-Nicolson", color="blue", linewidth=2, alpha=0.7)
+        axes[i].plot(x_np, prob_pinn,
+                     label="PINN", linestyle="--", color="black", linewidth=2)
+        axes[i].plot(x_np, prob_nn,
+                     label="NN", linestyle=":", color="gray", linewidth=1.5)
+        axes[i].axvspan(x_barrier_left, x_barrier_right,
+                        alpha=0.15, color="red", label="Barrera V₀")
+        axes[i].set_title(f"t = {t_val:.2f}", fontsize=12)
+        axes[i].set_xlabel("x")
         axes[i].set_ylabel("|Ψ|²")
         axes[i].legend(fontsize=8)
         axes[i].set_ylim(0, None)
+        axes[i].grid(True)
 
-    axes[-1].set_xlabel("x")
-    fig.suptitle(f"Efecto Túnel — Época {epoch} | Pérdida: {loss:.4e}", fontsize=12)
     plt.tight_layout()
-
     os.makedirs(save_dir, exist_ok=True)
-    plt.savefig(os.path.join(save_dir, f"epoch_{epoch:05d}.png"), dpi=150)
+    fname = filename if filename else f"epoch_{epoch:05d}.png"
+    plt.savefig(os.path.join(save_dir, fname), dpi=150)
     plt.close()
 
+
+# ── Evaluación ────────────────────────────────────────────────────────────────
+
+def _eval_error(
+    model: torch.nn.Module,
+    x_eval: torch.Tensor,
+    prob_cn_full: np.ndarray,
+    t_cn: np.ndarray,
+    t_snap_vals: list,
+) -> float:
+    """Error L2 medio de |Ψ|² entre el modelo y Crank-Nicolson."""
+    device = x_eval.device
+    errors = []
+    for t_val in t_snap_vals:
+        idx_t    = int(np.argmin(np.abs(t_cn - t_val)))
+        t_tensor = torch.full((len(x_eval), 1), t_val, device=device)
+        with torch.no_grad():
+            u, v = model(x_eval, t_tensor)
+        prob_pred = (u ** 2 + v ** 2).cpu()
+        prob_ref  = torch.tensor(prob_cn_full[idx_t], dtype=torch.float32).unsqueeze(1)
+        errors.append(calculate_l2_error(prob_pred, prob_ref))
+    return float(np.mean(errors))
+
+
+# ── Entrenamiento PINN ────────────────────────────────────────────────────────
+def _train_pinn(
+    x_ic: torch.Tensor,
+    t_ic: torch.Tensor,
+    t_bc: torch.Tensor,
+    x_col: torch.Tensor,
+    t_col: torch.Tensor,
+    x_eval: torch.Tensor,
+    prob_cn_full: np.ndarray,
+    t_cn: np.ndarray,
+    t_snap_vals: list,
+    prob_cn_snaps: list,
+    x_min: float,
+    x_max: float,
+    x_barrier_left: float,
+    x_barrier_right: float,
+    x0: float,
+    sigma: float,
+    k0: float,
+    V0: float,
+    mass: float,
+    hbar: float,
+    t_max: float,
+    epochs: int,
+    lr: float,
+    warmup_epochs: int,
+    optimizer_name: str,
+    hidden_layers: list,
+    log_freq: int,
+    seed: int,
+    device: torch.device,
+    save_plots: bool = True,
+    model_nn: torch.nn.Module = None,
+    x_train: torch.Tensor = None,
+    t_train: torch.Tensor = None,
+    prob_train: torch.Tensor = None,
+    lambda_data: float = 0.1,
+    use_dynamic_weights: bool = False,
+) -> tuple[float, float, dict, torch.nn.Module]:
+    """
+    Entrena la PINN para el efecto túnel.
+    Loss: IC + BC + física + normalización + (opcional) datos dispersos.
+    Soporta pesos dinámicos adaptativos (solo en fase Adam).
+    """
+    set_seed(seed)
+    model = PINNTunnel(hidden_layers=hidden_layers).to(device)
+    label = "PINN"
+
+    use_data_pinn = x_train is not None
+
+    historial = {
+        "epoch":        [],
+        "total_loss":   [],
+        "data_loss":    [],
+        "ph_loss":      [],
+        "ic_loss":      [],
+        "bc_loss":      [],
+        "norm_loss":    [],
+        "lambda_ph":    [],
+        "lambda_bc":    [],
+        "lambda_norm":  [],
+        "lambda_data":  [],
+    }
+
+    if optimizer_name == "adam":
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+    elif optimizer_name == "lbfgs":
+        optimizer = optim.LBFGS(model.parameters(), lr=lr, max_iter=50)
+    elif optimizer_name == "adam+lbfgs":
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+    else:
+        raise ValueError(
+            f"Optimizador '{optimizer_name}' no reconocido. "
+            f"Usa 'adam', 'lbfgs' o 'adam+lbfgs'."
+        )
+
+    # ── Pesos dinámicos — estado inicial ──────────────────────────────────
+    lam_ph   = 1.0
+    lam_bc   = 1.0
+    lam_norm = 1.0
+    lam_data = lambda_data
+
+    with Timer() as timer:
+        for epoch in range(1, epochs + 1):
+
+            if optimizer_name == "adam+lbfgs" and epoch == int(epochs * 0.85) + 1:
+                print(f"\n[{label}] Cambiando a L-BFGS en época {epoch}\n")
+                optimizer = optim.LBFGS(model.parameters(), lr=0.01, max_iter=20)
+
+            if epoch < warmup_epochs:
+                ph_ramp = 0.0
+            else:
+                ph_ramp = min(1.0, (epoch - warmup_epochs) / 2000.0)
+
+            # ── Rama L-BFGS ───────────────────────────────────────────────
+            is_lbfgs = optimizer_name == "lbfgs" or (
+                optimizer_name == "adam+lbfgs" and epoch >= int(epochs * 0.85) + 1
+            )
+
+            if is_lbfgs:
+                def closure(ramp=ph_ramp):
+                    optimizer.zero_grad()
+                    ic_loss   = initial_condition_loss_tunnel(
+                        model, x_ic, t_ic, x0=x0, sigma=sigma, k0=k0
+                    )
+                    bc_loss   = boundary_loss_tunnel(
+                        model, t_bc, x_min=x_min, x_max=x_max
+                    )
+                    ph_loss   = physics_loss_tunnel(
+                        model, x_col, t_col,
+                        V0=V0, x_barrier_left=x_barrier_left,
+                        x_barrier_right=x_barrier_right,
+                        mass=mass, hbar=hbar,
+                    )
+                    norm_loss = normalization_loss_tunnel(
+                        model, x_ic, t_ic, domain_length=(x_max - x_min)
+                    )
+                    d_loss = (
+                        data_loss_tunnel(model, x_train, t_train, prob_train)
+                        if use_data_pinn
+                        else torch.tensor(0.0, device=device)
+                    )
+                    # L-BFGS usa pesos fijos — los dinámicos solo aplican en Adam
+                    total = (
+                        ic_loss
+                        + lam_bc   * bc_loss
+                        + ramp * lam_ph * ph_loss
+                        + lam_norm * norm_loss
+                        + lam_data * d_loss
+                    )
+                    total.backward()
+                    return total
+
+                result     = optimizer.step(closure)
+                total_loss = result if result is not None else torch.tensor(0.0, device=device)
+
+                with torch.no_grad():
+                    ic_loss   = initial_condition_loss_tunnel(
+                        model, x_ic, t_ic, x0=x0, sigma=sigma, k0=k0
+                    )
+                    bc_loss   = boundary_loss_tunnel(
+                        model, t_bc, x_min=x_min, x_max=x_max
+                    )
+                    norm_loss = normalization_loss_tunnel(
+                        model, x_ic, t_ic, domain_length=(x_max - x_min)
+                    )
+                    d_loss = (
+                        data_loss_tunnel(model, x_train, t_train, prob_train)
+                        if use_data_pinn
+                        else torch.tensor(0.0, device=device)
+                    )
+                ph_loss = torch.tensor(0.0, device=device)
+
+            # ── Rama Adam ─────────────────────────────────────────────────
+            else:
+                optimizer.zero_grad()
+
+                ic_loss   = initial_condition_loss_tunnel(
+                    model, x_ic, t_ic, x0=x0, sigma=sigma, k0=k0
+                )
+                bc_loss   = boundary_loss_tunnel(
+                    model, t_bc, x_min=x_min, x_max=x_max
+                )
+                ph_loss   = physics_loss_tunnel(
+                    model, x_col, t_col,
+                    V0=V0, x_barrier_left=x_barrier_left,
+                    x_barrier_right=x_barrier_right,
+                    mass=mass, hbar=hbar,
+                )
+                norm_loss = normalization_loss_tunnel(
+                    model, x_ic, t_ic, domain_length=(x_max - x_min)
+                )
+                d_loss = (
+                    data_loss_tunnel(model, x_train, t_train, prob_train)
+                    if use_data_pinn
+                    else torch.tensor(0.0, device=device)
+                )
+
+                # ── Pesos dinámicos (solo Adam, solo si ph_ramp > 0) ──────
+                if use_dynamic_weights and ph_ramp > 0.0:
+                    lam_ph, lam_bc, lam_norm, lam_data = update_dynamic_weights_tunnel(
+                        ic_loss=ic_loss,
+                        ph_loss=ph_loss,
+                        bc_loss=bc_loss,
+                        norm_loss=norm_loss,
+                        data_loss=d_loss,
+                        last_layer_weight=model.net[-1].weight,
+                        current_lambda_ph=lam_ph,
+                        current_lambda_bc=lam_bc,
+                        current_lambda_norm=lam_norm,
+                        current_lambda_data=lam_data,
+                    )
+
+                total_loss = (
+                    ic_loss
+                    + lam_bc   * bc_loss
+                    + ph_ramp * lam_ph * ph_loss
+                    + lam_norm * norm_loss
+                    + lam_data * d_loss
+                )
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+
+            if epoch % log_freq == 0 or epoch == epochs:
+                print(
+                    f"[{label}] Época {epoch:05d} | Total: {total_loss.item():.4e} "
+                    f"| IC: {ic_loss.item():.4e} | BC: {bc_loss.item():.4e} "
+                    f"| Física: {ph_loss.item():.4e} (×{ph_ramp:.2f}) "
+                    f"| Norma: {norm_loss.item():.4e} "
+                    f"| Datos: {d_loss.item():.4e}"
+                )
+                if use_dynamic_weights:
+                    print(
+                        f"           | λ_ph={lam_ph:.3f} λ_bc={lam_bc:.3f} "
+                        f"λ_norm={lam_norm:.3f} λ_data={lam_data:.3f}"
+                    )
+
+                historial["epoch"].append(epoch)
+                historial["total_loss"].append(total_loss.item())
+                historial["data_loss"].append(d_loss.item())
+                historial["ph_loss"].append(ph_loss.item())
+                historial["ic_loss"].append(ic_loss.item())
+                historial["bc_loss"].append(bc_loss.item())
+                historial["norm_loss"].append(norm_loss.item())
+                historial["lambda_ph"].append(lam_ph)
+                historial["lambda_bc"].append(lam_bc)
+                historial["lambda_norm"].append(lam_norm)
+                historial["lambda_data"].append(lam_data)
+
+                if save_plots and model_nn is not None:
+                    _plot_tunnel_results(
+                        model, model_nn, x_eval,
+                        t_snap_vals, prob_cn_snaps,
+                        x_barrier_left, x_barrier_right,
+                        epoch, total_loss.item(),
+                        save_dir="img/tunnel/pinn",
+                    )
+
+    error_l2 = _eval_error(model, x_eval, prob_cn_full, t_cn, t_snap_vals)
+    return error_l2, timer.elapsed, historial, model
+# ── Entrenamiento NN pura ─────────────────────────────────────────────────────
+
+def _train_nn(
+    x_train: torch.Tensor,
+    t_train: torch.Tensor,
+    prob_train: torch.Tensor,
+    x_eval: torch.Tensor,
+    prob_cn_full: np.ndarray,
+    t_cn: np.ndarray,
+    t_snap_vals: list,
+    epochs: int,
+    lr: float,
+    optimizer_name: str,
+    hidden_layers: list,
+    log_freq: int,
+    seed: int,
+    device: torch.device,
+    save_plots: bool = True,
+) -> tuple[float, float, dict, torch.nn.Module]:
+    """
+    Entrena una NN pura con datos de Crank-Nicolson.
+    Loss: (u² + v² - |Ψ|²_CN)² — sin restricciones físicas.
+    """
+    set_seed(seed)
+    model = PINNTunnel(hidden_layers=hidden_layers).to(device)
+    label = "NN"
+
+    historial = {
+        "epoch":      [],
+        "total_loss": [],
+        "data_loss":  [],
+    }
+
+    if optimizer_name in ("adam", "adam+lbfgs"):
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+    elif optimizer_name == "lbfgs":
+        optimizer = optim.LBFGS(model.parameters(), lr=lr, max_iter=50)
+    else:
+        raise ValueError(f"Optimizador '{optimizer_name}' no reconocido.")
+
+    with Timer() as timer:
+        for epoch in range(1, epochs + 1):
+
+            if optimizer_name == "adam+lbfgs" and epoch == int(epochs * 0.85) + 1:
+                print(f"\n[{label}] Cambiando a L-BFGS en época {epoch}\n")
+                optimizer = optim.LBFGS(model.parameters(), lr=0.01, max_iter=20)
+
+            def closure():
+                optimizer.zero_grad()
+                u, v      = model(x_train, t_train)
+                prob_pred = u ** 2 + v ** 2
+                data_loss = torch.mean((prob_pred - prob_train) ** 2)
+                data_loss.backward()
+                return data_loss
+
+            if optimizer_name == "lbfgs" or (
+                optimizer_name == "adam+lbfgs" and epoch >= int(epochs * 0.85) + 1
+            ):
+                result     = optimizer.step(closure)
+                total_loss = result if result is not None else torch.tensor(0.0, device=device)
+                with torch.no_grad():
+                    u, v      = model(x_train, t_train)
+                    data_loss = torch.mean((u ** 2 + v ** 2 - prob_train) ** 2)
+            else:
+                optimizer.zero_grad()
+                u, v       = model(x_train, t_train)
+                prob_pred  = u ** 2 + v ** 2
+                data_loss  = torch.mean((prob_pred - prob_train) ** 2)
+                total_loss = data_loss
+                total_loss.backward()
+                optimizer.step()
+
+            if epoch % log_freq == 0 or epoch == epochs:
+                print(f"[{label}] Época {epoch:05d} | Pérdida: {total_loss.item():.4e}")
+                historial["epoch"].append(epoch)
+                historial["total_loss"].append(total_loss.item())
+                historial["data_loss"].append(data_loss.item())
+
+    error_l2 = _eval_error(model, x_eval, prob_cn_full, t_cn, t_snap_vals)
+    return error_l2, timer.elapsed, historial, model
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main(
     x_min: float = -10.0,
     x_max: float = 10.0,
     t_max: float = 3.0,
-    V0: float = 3,
+    V0: float = 3.0,
     x_barrier_left: float = 0.5,
     x_barrier_right: float = 1.5,
     x0: float = -4.0,
@@ -84,175 +486,311 @@ def main(
     num_collocation: int = 5000,
     num_ic_points: int = 500,
     num_bc_points: int = 200,
+    num_train_points: int = 100,
+    sampler: str = "lhs",
     log_freq: int = 2000,
-    warmup_epochs: int = 3000,
+    warmup_epochs: int = 5000,
+    optimizer_name: str = "adam",
+    hidden_layers: list = None,
+    seed: int = 42,
+    save_plots: bool = True,
+    save_final_plot: bool = True,
+    use_data_pinn: bool = False,
+    lambda_data: float = 0.1,
+    use_dynamic_weights: bool = False,
 ):
-    set_seed(42)
+    if hidden_layers is None:
+        hidden_layers = [64, 64, 64, 64]
+
+    set_seed(seed)
+    device = get_device()
+
     os.makedirs("img/tunnel", exist_ok=True)
-    os.makedirs("results/tunnel", exist_ok=True)
+    os.makedirs("results", exist_ok=True)
 
-    print("--- Iniciando Entrenamiento (Efecto Túnel Cuántico) ---")
-    print(f"Barrera: V₀={V0} en x∈[{x_barrier_left}, {x_barrier_right}] | k₀={k0} | E≈{k0**2/2:.2f}")
-    print(f"Condición túnel: E < V₀ → {k0**2/2:.2f} < {V0} → {'✓ SÍ hay túnel' if k0**2/2 < V0 else '✗ NO hay túnel'}\n")
+    config_exp = {
+        "sistema":          "tunnel",
+        "x_min":            x_min,
+        "x_max":            x_max,
+        "t_max":            t_max,
+        "V0":               V0,
+        "x_barrier_left":   x_barrier_left,
+        "x_barrier_right":  x_barrier_right,
+        "x0":               x0,
+        "sigma":            sigma,
+        "k0":               k0,
+        "mass":             mass,
+        "hbar":             hbar,
+        "epochs":           epochs,
+        "lr":               lr,
+        "num_collocation":  num_collocation,
+        "num_ic_points":    num_ic_points,
+        "num_bc_points":    num_bc_points,
+        "num_train_points": num_train_points,
+        "sampler":          sampler,
+        "warmup_epochs":    warmup_epochs,
+        "optimizer":        optimizer_name,
+        "hidden_layers":    hidden_layers,
+        "seed":             seed,
+        "use_data_pinn":    use_data_pinn,
+        "lambda_data":      lambda_data,
+        "use_dynamic_weights": use_dynamic_weights,
+    }
 
-    # 1. Modelo y optimizador
-    model = PINNTunnel(hidden_layers=[64, 64, 64, 64])
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5000, gamma=0.5)
+    print("=" * 60)
+    print("Efecto Túnel Cuántico — TDSE")
+    print(
+        f"Sampler: {sampler} | Colocación: {num_collocation} | "
+        f"IC: {num_ic_points} | BC: {num_bc_points} | Train: {num_train_points} | "
+        f"Épocas: {epochs} | Optimizador: {optimizer_name} | lr: {lr}"
+    )
+    print(
+        f"Warmup: {warmup_epochs} | Seed: {seed} | "
+        f"PINN con datos: {use_data_pinn}| "
+        f"Pesos dinámicos: {use_dynamic_weights}"
+    )
+    print(
+        f"Barrera: V₀={V0} en x∈[{x_barrier_left}, {x_barrier_right}] | "
+        f"k₀={k0} | E≈{k0**2/2:.2f} | "
+        f"{'Hay túnel' if k0**2/2 < V0 else 'No hay túnel'}"
+    )
+    print("=" * 60)
 
-    # 2. Puntos de condición inicial (t=0)
-    x_ic = generate_grid_points(x_min, x_max, num_ic_points, requires_grad=False)
-    t_ic = torch.zeros(num_ic_points, 1)
-
-    # 3. Puntos de frontera temporal (muestreados aleatoriamente en t)
-    t_bc = torch.rand(num_bc_points, 1) * t_max
-
-    # 4. Ground truth numérico (Crank-Nicolson)
-    x_cn = np.linspace(x_min, x_max, 300)
-    t_cn = np.linspace(0.0, t_max, 100)
-    print("Calculando solución de referencia (Crank-Nicolson)...")
-    ref_cn = measure_numerical_reference(
+    # 1. Referencia Crank-Nicolson
+    print("\nCalculando solución de referencia (Crank-Nicolson)...")
+    Nx_cn  = 500
+    dx_cn  = (x_max - x_min) / (Nx_cn - 1)
+    dt_max = 0.5 * mass * dx_cn / (hbar * k0)
+    Nt_cn  = int(np.ceil(t_max / dt_max)) + 1
+    x_cn   = np.linspace(x_min, x_max, Nx_cn)
+    t_cn   = np.linspace(0.0, t_max, Nt_cn)
+    ref_cn       = measure_numerical_reference(
         sistema="tunnel",
-        x_or_t=x_cn,
-        t_array=t_cn,
+        x_or_t=x_cn, t_array=t_cn,
         x0=x0, sigma=sigma, k0=k0,
         V0=V0, x_barrier_left=x_barrier_left,
         x_barrier_right=x_barrier_right,
         mass=mass, hbar=hbar,
     )
     prob_cn_full = ref_cn["solution"]
+    time_cn      = ref_cn["time_s"]
     print("Referencia calculada.\n")
 
-    # Instantes para visualizar
-    t_snap_vals = [0.0, t_max * 0.33, t_max * 0.66, t_max]
-    t_snap_idx  = [np.argmin(np.abs(t_cn - tv)) for tv in t_snap_vals]
+    t_snap_vals   = [0.0, t_max * 0.33, t_max * 0.66, t_max]
+    t_snap_idx    = [np.argmin(np.abs(t_cn - tv)) for tv in t_snap_vals]
     prob_cn_snaps = [prob_cn_full[i] for i in t_snap_idx]
-    x_eval = torch.tensor(x_cn, dtype=torch.float32).unsqueeze(1)
+    x_eval        = torch.tensor(x_cn, dtype=torch.float32).unsqueeze(1).to(device)
 
-    historial = {
-        "epoch": [], "total_loss": [],
-        "ph_loss": [], "ic_loss": [], "bc_loss": [], "norm_loss": []
-    }
+    # 2. Puntos de condición inicial (t=0)
+    x_ic_np = np.linspace(x_min, x_max, num_ic_points)
+    x_ic    = torch.tensor(x_ic_np, dtype=torch.float32).unsqueeze(1).to(device)
+    t_ic    = torch.zeros(num_ic_points, 1, device=device)
 
-    # 5. Bucle de entrenamiento
-    with Timer as t_pinn:
-        for epoch in range(1, epochs + 1):
-            optimizer.zero_grad()
+    # 3. Puntos de frontera
+    torch.manual_seed(seed)
+    t_bc = torch.rand(num_bc_points, 1, device=device) * t_max
 
-            # Remuestreo de puntos de colocación cada época (mejora la exploración)
-            x_col, t_col = sample_collocation_2d(x_min, x_max, 0.0, t_max, num_collocation)
+    # 4. Puntos de colocación (fijos)
+    x_col, t_col = sample_collocation_2d(
+        x_min, x_max, 0.0, t_max, num_collocation,
+        sampler=sampler, device=device,
+    )
 
-            # A) Condición inicial
-            ic_loss = initial_condition_loss_tunnel(
-                model, x_ic, t_ic, x0=x0, sigma=sigma, k0=k0
-            )
+    # 5. Datos de entrenamiento (compartidos por NN y, opcionalmente, PINN)
+    np.random.seed(seed)
+    x_train_np = np.random.uniform(x_min, x_max, num_train_points)
+    t_train_np = np.random.uniform(0.0,   t_max,  num_train_points)
 
-            # B) Condición de frontera
-            bc_loss = boundary_loss_tunnel(model, t_bc, x_min=x_min, x_max=x_max)
+    from scipy.interpolate import RegularGridInterpolator
+    interp_cn     = RegularGridInterpolator(
+        (t_cn, x_cn), prob_cn_full,
+        method="linear", bounds_error=False, fill_value=0.0,
+    )
+    prob_train_np = interp_cn(np.stack([t_train_np, x_train_np], axis=1))
 
-            # C) Residuo físico (con curriculum)
-            ph_loss = physics_loss_tunnel(
-                model, x_col, t_col,
-                V0=V0, x_barrier_left=x_barrier_left,
-                x_barrier_right=x_barrier_right,
-                mass=mass, hbar=hbar
-            )
+    x_train    = torch.tensor(x_train_np,    dtype=torch.float32).unsqueeze(1).to(device)
+    t_train    = torch.tensor(t_train_np,    dtype=torch.float32).unsqueeze(1).to(device)
+    prob_train = torch.tensor(prob_train_np, dtype=torch.float32).unsqueeze(1).to(device)
 
-            # D) Normalización
-            norm_loss = normalization_loss_tunnel(
-                model, x_ic, t_ic, domain_length=(x_max - x_min)
-            )
+    # 6. Entrenar NN pura primero
+    print("\n--- NN pura (datos CN, sin física) ---")
+    error_nn, time_nn, hist_nn, model_nn = _train_nn(
+        x_train=x_train, t_train=t_train, prob_train=prob_train,
+        x_eval=x_eval, prob_cn_full=prob_cn_full, t_cn=t_cn,
+        t_snap_vals=t_snap_vals,
+        epochs=epochs, lr=lr,
+        optimizer_name=optimizer_name, hidden_layers=hidden_layers,
+        log_freq=log_freq, seed=seed, device=device, save_plots=save_plots,
+    )
 
-            # E) Curriculum: la física entra gradualmente
-            if epoch < warmup_epochs:
-                ph_ramp = 0.0
-            else:
-                ph_ramp = min(1.0, (epoch - warmup_epochs) / 2000.0)
+    # 7. Entrenar PINN
+    print("\n--- PINN (física" + (" + datos)" if use_data_pinn else ")") + " ---")
+    error_pinn, time_pinn, hist_pinn, model_pinn = _train_pinn(
+        x_ic=x_ic, t_ic=t_ic, t_bc=t_bc,
+        x_col=x_col, t_col=t_col,
+        x_eval=x_eval, prob_cn_full=prob_cn_full, t_cn=t_cn,
+        t_snap_vals=t_snap_vals, prob_cn_snaps=prob_cn_snaps,
+        x_min=x_min, x_max=x_max,
+        x_barrier_left=x_barrier_left, x_barrier_right=x_barrier_right,
+        x0=x0, sigma=sigma, k0=k0, V0=V0, mass=mass, hbar=hbar,
+        t_max=t_max, epochs=epochs, lr=lr,
+        warmup_epochs=warmup_epochs,
+        optimizer_name=optimizer_name, hidden_layers=hidden_layers,
+        log_freq=log_freq, seed=seed, device=device, save_plots=save_plots,
+        model_nn=model_nn,
+        x_train=x_train if use_data_pinn else None,
+        t_train=t_train if use_data_pinn else None,
+        prob_train=prob_train if use_data_pinn else None,
+        lambda_data=lambda_data,
+        use_dynamic_weights=use_dynamic_weights,
+    )
 
-            total_loss = (
-                ic_loss
-                + bc_loss
-                + ph_ramp * ph_loss
-                + 0.1 * norm_loss
-            )
+    # 8. Gráfica final
+    if save_final_plot:
+        _plot_tunnel_results(
+            model_pinn, model_nn, x_eval,
+            t_snap_vals, prob_cn_snaps,
+            x_barrier_left, x_barrier_right,
+            epoch=epochs, loss=hist_pinn["total_loss"][-1],
+            save_dir="img/tunnel",
+            filename="comparativa_final.png",
+        )
 
-            total_loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            if epoch % log_freq == 0 or epoch == epochs:
-                print(
-                    f"Época {epoch:05d} | Total: {total_loss.item():.4e} "
-                    f"| IC: {ic_loss.item():.4e} | BC: {bc_loss.item():.4e} "
-                    f"| Física: {ph_loss.item():.4e} (×{ph_ramp:.2f}) "
-                    f"| Norma: {norm_loss.item():.4e}"
-                )
-
-                historial["epoch"].append(epoch)
-                historial["total_loss"].append(total_loss.item())
-                historial["ph_loss"].append(ph_loss.item())
-                historial["ic_loss"].append(ic_loss.item())
-                historial["bc_loss"].append(bc_loss.item())
-                historial["norm_loss"].append(norm_loss.item())
-
-                plot_tunnel_results(
-                    model, x_eval, t_snap_vals,
-                    prob_cn_snaps, epoch, total_loss.item(),
-                    save_dir="img/tunnel"
-                )
-
-    # 6. Evaluación final
-    t_final = torch.full((len(x_eval), 1), t_max)
+    # 9. Coeficientes de transmisión
+    dx      = x_cn[1] - x_cn[0]
+    t_final = torch.full((len(x_eval), 1), t_max, device=device)
     with torch.no_grad():
-        u_f, v_f = model(x_eval, t_final)
-    prob_pinn_final = (u_f**2 + v_f**2).numpy().flatten()
+        u_p, v_p = model_pinn(x_eval, t_final)
+        u_n, v_n = model_nn(x_eval,   t_final)
+
+    prob_pinn_final = (u_p ** 2 + v_p ** 2).cpu().numpy().flatten()
+    prob_nn_final   = (u_n ** 2 + v_n ** 2).cpu().numpy().flatten()
     prob_cn_final   = prob_cn_full[-1]
 
-    prob_pinn_t = torch.tensor(prob_pinn_final).unsqueeze(1)
-    prob_cn_t   = torch.tensor(prob_cn_final).unsqueeze(1)
-    error_l2    = calculate_l2_error(prob_pinn_t, prob_cn_t)
+    T_cn   = float(np.sum(prob_cn_final[x_cn   > x_barrier_right]) * dx)
+    T_pinn = float(np.sum(prob_pinn_final[x_cn > x_barrier_right]) * dx)
+    T_nn   = float(np.sum(prob_nn_final[x_cn   > x_barrier_right]) * dx)
 
-    dx     = x_cn[1] - x_cn[0]
-    T_cn   = np.sum(prob_cn_final[x_cn > x_barrier_right]) * dx
-    T_pinn = np.sum(prob_pinn_final[x_cn > x_barrier_right]) * dx
-
-    print(f"\n--- RESULTADOS FINALES (Efecto Túnel) ---")
-    print(f"Error L2 en |Ψ|²:       {error_l2:.4e}")
-    print(f"Coef. transmisión CN:   {T_cn:.4f}")
-    print(f"Coef. transmisión PINN: {T_pinn:.4f}")
-    print(f"Tiempo PINN:            {t_pinn.elapsed:.2f}s")
-    print(f"Tiempo Crank-Nicolson:  {ref_cn['time_s']:.4f}s")
-    print(f"Speedup (CN/PINN):      {ref_cn['time_s']/t_pinn.elapsed:.4f}x\n")
-
+    # 10. Resultados finales
     final_results = {
-        "error_L2":          error_l2,
-        "T_cn":              float(T_cn),
-        "T_pinn":            float(T_pinn),
-        "pinn_time_s":       t_pinn.elapsed,
-        "numerical_time_s":  ref_cn["time_s"],
-        "numerical_method":  ref_cn["method"],
-        "speedup":           ref_cn["time_s"] / t_pinn.elapsed,
+        "pinn": {
+            "error_L2_mean": error_pinn,
+            "time_s":        time_pinn,
+            "T_pinn":        T_pinn,
+        },
+        "nn": {
+            "error_L2_mean": error_nn,
+            "time_s":        time_nn,
+            "T_nn":          T_nn,
+        },
+        "crank_nicolson": {
+            "time_s": time_cn,
+            "T_cn":   T_cn,
+            "method": ref_cn["method"],
+        },
     }
 
-    save_experiment_results(
-        {
-            "sistema":   "tunnel",
-            "sampler":   "lhs",
-            "estado_n":  0,
-            "V0":        V0,
-            "k0":        k0,
-            "epochs":    epochs,
-        },
-        final_results,
-        historial,
-        save_dir="results"
-    )
+    historial_completo = {
+        "pinn": hist_pinn,
+        "nn":   hist_nn,
+    }
+
+    print(f"\n{'=' * 60}")
+    print("RESULTADOS FINALES (Efecto Túnel)")
+    print(f"{'Método':<15} {'Error L2':>12} {'T (transmisión)':>16} {'Tiempo (s)':>12}")
+    print(f"{'Crank-Nicolson':<15} {'—':>12} {T_cn:>16.4f} {time_cn:>12.4f}")
+    print(f"{'NN pura':<15} {error_nn:>12.4e} {T_nn:>16.4f} {time_nn:>12.2f}")
+    print(f"{'PINN':<15} {error_pinn:>12.4e} {T_pinn:>16.4f} {time_pinn:>12.2f}")
+    print("=" * 60)
+
+    save_experiment_results(config_exp, final_results, historial_completo)
 
 
 if __name__ == "__main__":
-    main(
+
+    SEEDS = [42, 123, 7, 99, 2024, 314, 17, 56, 88, 200]
+
+    BASE = dict(
+        x_min=-10.0, x_max=10.0, t_max=3.0,
+        V0=3.0, x_barrier_left=0.5, x_barrier_right=1.5,
+        x0=-4.0, sigma=0.75, k0=2.0,
+        mass=1.0, hbar=1.0,
         epochs=20000,
-        log_freq=2000,
+        lr=1e-3,
         num_collocation=5000,
-        warmup_epochs=3000,
+        num_ic_points=500,
+        num_bc_points=200,
+        num_train_points=100,
+        sampler="lhs",
+        warmup_epochs=5000,
+        optimizer_name="adam",
+        hidden_layers=[64, 64, 64, 64],
+        log_freq=20000,
+        save_plots=False,
+        save_final_plot=True,
+        use_data_pinn=True,   
+        lambda_data=1,
+        use_dynamic_weights=False,
     )
+
+    variaciones = [
+        # --- BASE (PINN con datos) ---
+        {},
+
+        # --- Eje 1: Puntos de colocación ---
+        {"num_collocation": 1000},
+        {"num_collocation": 2000},
+        {"num_collocation": 10000},
+
+        # --- Eje 2: Sampler ---
+        {"sampler": "grid"},
+
+        # --- Eje 3: Optimizador ---
+        {"optimizer_name": "adam+lbfgs"},
+
+        # --- Eje 4: Arquitectura ---
+        {"hidden_layers": [128, 128, 128, 128]},
+
+        # --- Eje 5: Learning rate ---
+        {"lr": 0.01},
+
+        # --- Eje 6: Warmup epochs ---
+        {"warmup_epochs": 0},
+        {"warmup_epochs": 2500},
+        {"warmup_epochs": 7500},
+
+        # --- Eje 7: Altura de barrera ---
+        {"V0": 2.5},
+        {"V0": 5.0},
+
+
+        # --- Eje 8: Puntos de entrenamiento ---
+        {"num_train_points": 20},
+        {"num_train_points": 50},
+        {"num_train_points": 200},
+
+        # --- Eje 9: PINN sin datos ---
+        {"use_data_pinn": False},
+        
+        # --- Eje 10: Pesos dinámicos ---
+        {"use_dynamic_weights": True},
+    ]
+
+    total_configs = len(variaciones)
+    total_runs    = total_configs * len(SEEDS)
+
+    print(f"\n{'=' * 60}")
+    print(f"ESTUDIO DE SENSIBILIDAD — Efecto Túnel")
+    print(f"Configuraciones: {total_configs} | Seeds: {len(SEEDS)} | Total ejecuciones: {total_runs}")
+    print(f"{'=' * 60}\n")
+
+    for i, variacion in enumerate(variaciones, start=1):
+        if i > 14:# Le toca la configuración 15
+            config = {**BASE, **variacion}
+            print(f"\n{'#' * 60}")
+            print(f"Configuración {i}/{total_configs}: {variacion if variacion else 'BASE'}")
+            print(f"{'#' * 60}")
+
+            for j, seed in enumerate(SEEDS, start=1):
+                print(f"\n  Seed {j}/{len(SEEDS)}: {seed}")
+                main(**config, seed=seed)

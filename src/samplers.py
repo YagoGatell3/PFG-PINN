@@ -6,16 +6,17 @@ def generate_grid_points(
     x_min: float, x_max: float, num_points: int, requires_grad: bool = True
 ) -> torch.Tensor:
     """
-    Genera una malla de puntos equidistantes.
+    Genera una malla espacial unidimensional con puntos uniformemente espaciados.
 
     Args:
-        x_min (float): Límite inferior del dominio.
-        x_max (float): Límite superior del dominio.
-        num_points (int): Número de puntos a generar.
-        requires_grad (bool): Si es True, PyTorch rastreará las derivadas en estos puntos.
+        x_min (float): Límite inferior del dominio espacial.
+        x_max (float): Límite superior del dominio espacial.
+        num_points (int): Número de puntos a generar en la malla.
+        requires_grad (bool, opcional): Si es True, habilita el cálculo de gradientes 
+                                        para diferenciación automática. Por defecto es True.
 
     Returns:
-        torch.Tensor: Tensor columna de forma (num_points, 1).
+        torch.Tensor: Tensor columna de dimensión (num_points, 1) con las coordenadas.
     """
     x = torch.linspace(x_min, x_max, num_points).unsqueeze(1)
     if requires_grad:
@@ -27,18 +28,17 @@ def generate_random_points(
     x_min: float, x_max: float, num_points: int, requires_grad: bool = True
 ) -> torch.Tensor:
     """
-    Genera puntos aleatorios con distribución uniforme continua.
+    Genera un conjunto de puntos espaciales muestreados desde una distribución uniforme continua.
 
     Args:
-        x_min (float): Límite inferior.
-        x_max (float): Límite superior.
-        num_points (int): Número de puntos a generar.
-        requires_grad (bool): Si es True, PyTorch rastreará las derivadas.
+        x_min (float): Límite inferior del dominio espacial.
+        x_max (float): Límite superior del dominio espacial.
+        num_points (int): Número de puntos aleatorios a generar.
+        requires_grad (bool, opcional): Si es True, habilita el cálculo de gradientes. Por defecto es True.
 
     Returns:
-        torch.Tensor: Tensor columna de forma (num_points, 1).
+        torch.Tensor: Tensor columna de dimensión (num_points, 1) con las coordenadas.
     """
-
     x = x_min + (x_max - x_min) * torch.rand((num_points, 1))
     if requires_grad:
         x.requires_grad_(True)
@@ -49,16 +49,17 @@ def generate_boundary_points(
     x_min: float, x_max: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Genera los tensores correspondientes a las fronteras del dominio espacial.
+    Genera los tensores correspondientes a las fronteras estrictas del dominio espacial.
 
     Args:
-        x_min (float): Límite inferior.
-        x_max (float): Límite superior.
+        x_min (float): Límite inferior del dominio.
+        x_max (float): Límite superior del dominio.
 
     Returns:
-        tuple: (tensor_frontera_izquierda, tensor_frontera_derecha)
+        tuple[torch.Tensor, torch.Tensor]: Tupla conteniendo:
+            - Tensor con la coordenada de la frontera izquierda.
+            - Tensor con la coordenada de la frontera derecha.
     """
-
     x_left = torch.tensor([[x_min]], dtype=torch.float32)
     x_right = torch.tensor([[x_max]], dtype=torch.float32)
 
@@ -69,28 +70,29 @@ def generate_lhs_points(
     x_min: float, x_max: float, num_points: int, requires_grad: bool = True
 ) -> torch.Tensor:
     """
-    Genera puntos utilizando Latin Hypercube Sampling (LHS).
-    Garantiza una cobertura uniforme del dominio manteniendo la aleatoriedad.
+    Genera puntos de colocación utilizando Latin Hypercube Sampling (LHS).
+    Este método garantiza una cobertura pseudoaleatoria más uniforme y representativa 
+    del dominio en comparación con el muestreo puramente aleatorio.
 
     Args:
-        x_min (float): Límite inferior del dominio.
-        x_max (float): Límite superior del dominio.
-        num_points (int): Número de puntos a generar.
-        requires_grad (bool): Si es True, PyTorch rastreará las derivadas.
+        x_min (float): Límite inferior del dominio espacial.
+        x_max (float): Límite superior del dominio espacial.
+        num_points (int): Número de puntos de muestra a generar.
+        requires_grad (bool, opcional): Si es True, habilita el cálculo de gradientes. Por defecto es True.
 
     Returns:
-        torch.Tensor: Tensor columna de forma (num_points, 1).
+        torch.Tensor: Tensor columna de dimensión (num_points, 1) con las coordenadas LHS.
     """
-    # 1. Instancia del motor LHS para 1 dimensión (d=1)
+    # Instancia del motor LHS para un espacio unidimensional (d=1)
     sampler = qmc.LatinHypercube(d=1)
 
-    # 2. Generación de las muestras.
+    # Generación de muestras en el intervalo normalizado [0, 1)
     sample = sampler.random(n=num_points)
 
-    # 3. Escala matemáticamente al dominio físico.
+    # Mapeo lineal de las muestras al dominio físico [x_min, x_max]
     scaled_sample = x_min + sample * (x_max - x_min)
 
-    # 4. Conversión del array de NumPy a un tensor de PyTorch.
+    # Conversión estructural a tensor de PyTorch
     x = torch.tensor(scaled_sample, dtype=torch.float32)
 
     if requires_grad:

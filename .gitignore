@@ -137,3 +137,6 @@ results/
 
 # Archivos de Mac
 .DS_Store.DS_Store
+
+# Ignorar carpetas de resultados y figuras
+figures_analysis*/
