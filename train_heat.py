@@ -32,7 +32,18 @@ def sample_collocation_2d(
     n_points: int,
     sampler: str = "lhs",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Muestrea puntos de colocación (x, t) en el dominio 2D."""
+    """
+    Genera puntos de colocación (x, t) dentro del dominio espaciotemporal 2D.
+
+    Args:
+        x_min, x_max: Límites espaciales del dominio.
+        t_min, t_max: Límites temporales del dominio.
+        n_points: Número total de puntos a generar.
+        sampler: Estrategia de muestreo ('lhs' para Latin Hypercube, 'grid' para malla regular).
+
+    Returns:
+        Tupla de tensores (x, t) con requires_grad=True para el cálculo de derivadas físicas.
+    """
     if sampler == "lhs":
         engine = qmc.LatinHypercube(d=2)
         pts    = engine.random(n=n_points)
@@ -52,7 +63,7 @@ def sample_collocation_2d(
     return x, t
 
 
-# ── Plots ─────────────────────────────────────────────────────────────────────
+# ── Visualizaciones ───────────────────────────────────────────────────────────
 
 def _plot_heatmaps(
     model: torch.nn.Module,
@@ -64,7 +75,12 @@ def _plot_heatmaps(
     x_train: torch.Tensor = None,
     t_train: torch.Tensor = None,
 ):
-    """PNG 1: Heatmaps 2D — Analítica, Predicción, |Error|."""
+    """
+    Genera y guarda una comparativa 2D (Heatmaps) mostrando:
+    1. La solución analítica exacta.
+    2. La predicción del modelo espacial.
+    3. El mapa de error absoluto entre ambos.
+    """
     import matplotlib.pyplot as plt
 
     nx, nt = 200, 200
@@ -88,12 +104,15 @@ def _plot_heatmaps(
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
+    # Analítica
     im0 = axes[0].pcolormesh(x_np, t_np, U_exact, cmap="viridis",
                              vmin=vmin, vmax=vmax, shading="auto")
     fig.colorbar(im0, ax=axes[0], label="u(x,t)")
     axes[0].set_title("Analítica", fontsize=13, fontweight="bold")
     axes[0].set_xlabel("x")
     axes[0].set_ylabel("t")
+    
+    # Puntos de entrenamiento superpuestos (si se proporcionan)
     if x_train is not None and t_train is not None:
         axes[0].scatter(
             x_train.detach().numpy().flatten(),
@@ -103,6 +122,7 @@ def _plot_heatmaps(
         )
         axes[0].legend(fontsize=9, loc="upper right")
 
+    # Predicción
     im1 = axes[1].pcolormesh(x_np, t_np, U_pred, cmap="viridis",
                              vmin=vmin, vmax=vmax, shading="auto")
     fig.colorbar(im1, ax=axes[1], label="u(x,t)")
@@ -110,6 +130,7 @@ def _plot_heatmaps(
     axes[1].set_xlabel("x")
     axes[1].set_ylabel("t")
 
+    # Error absoluto
     im2 = axes[2].pcolormesh(x_np, t_np, U_err, cmap="hot", shading="auto")
     fig.colorbar(im2, ax=axes[2], label="|u_exact − u_pred|")
     axes[2].set_title("Error absoluto", fontsize=13, fontweight="bold")
@@ -132,7 +153,10 @@ def _plot_surface_3d(
     epoch: int,
     label: str,
 ):
-    """PNG 2: Superficie 3D — Analítica y Predicción superpuestas."""
+    """
+    Genera y guarda una proyección 3D superponiendo la solución analítica
+    y la predicción de la red en todo el dominio.
+    """
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
     from matplotlib.patches import Patch
@@ -184,7 +208,10 @@ def _plot_alpha_convergence(
     alpha_true: float,
     label: str,
 ):
-    """Evolución de alpha durante el entrenamiento."""
+    """
+    Grafica la evolución del parámetro físico alpha (difusividad térmica)
+    descubierto por el modelo a lo largo de las épocas de entrenamiento.
+    """
     import matplotlib.pyplot as plt
 
     epochs_hist = historial["epoch"]
@@ -218,7 +245,10 @@ def _eval_snapshots(
     L: float,
     n_eval: int = 300,
 ) -> list:
-    """Calcula el error L2 en cada snapshot temporal."""
+    """
+    Calcula el error L2 discretizado espacialmente evaluando el modelo 
+    en momentos temporales concretos (snapshots).
+    """
     x_eval = torch.linspace(0.0, L, n_eval).unsqueeze(1)
     errors = []
     for t_val in t_snap_vals:
@@ -257,8 +287,9 @@ def _train_pinn(
     save_plots: bool = True,
 ) -> tuple[float, float, dict]:
     """
-    Entrena la PINN para el problema inverso de la ecuación del calor.
-    Descubre alpha a partir de datos (posiblemente ruidosos).
+    Entrena la red neuronal informada por la física (PINN) para el problema inverso
+    de la ecuación del calor. Descubre la difusividad (alpha) simultáneamente
+    al ajuste del campo de temperaturas a partir de datos dispersos.
     """
     set_seed(seed)
     model = PINNHeatInverse(hidden_layers=hidden_layers, alpha_init=alpha_init)
@@ -275,6 +306,7 @@ def _train_pinn(
         "lambda_ph":  [],
     }
 
+    # Configuración del optimizador: alpha utiliza un factor multiplicador en su LR
     if optimizer_name == "adam":
         optimizer = optim.Adam([
             {"params": model.net.parameters(), "lr": lr},
@@ -302,6 +334,7 @@ def _train_pinn(
                 print(f"\n[{label}] Cambiando a L-BFGS en época {epoch}\n")
                 optimizer = optim.LBFGS(model.parameters(), lr=0.01, max_iter=50)
 
+            # Rampa de calentamiento (warmup) para introducir la física progresivamente
             if epoch < warmup_epochs:
                 ph_ramp = 0.0
             else:
@@ -349,6 +382,7 @@ def _train_pinn(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
+            # Aseguramos estabilidad física del parámetro
             with torch.no_grad():
                 model.alpha.clamp_(1e-4, 10.0)
 
@@ -417,8 +451,8 @@ def _train_nn(
     save_plots: bool = True,
 ) -> tuple[float, float, dict]:
     """
-    Entrena una NN pura (sin física) con los mismos datos.
-    Sirve como baseline para comparar con la PINN.
+    Entrena un modelo puramente de datos (NN estándar sin restricciones físicas)
+    para establecer un marco de comparación (baseline).
     """
     set_seed(seed)
     model = PINNHeatInverse(hidden_layers=hidden_layers, alpha_init=alpha_init)
@@ -488,7 +522,7 @@ def _train_nn(
     return error_l2_mean, timer.elapsed, historial
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# ── Controlador Principal ─────────────────────────────────────────────────────
 
 def main(
     L: float = 1.0,
@@ -511,6 +545,12 @@ def main(
     seed: int = 42,
     save_plots: bool = True,
 ):
+    """
+    Función orquestadora del experimento. Controla la inicialización del 
+    problema físico, la generación de puntos de muestreo (con/sin ruido), 
+    la ejecución del entrenamiento y la evaluación frente a solucionadores 
+    tradicionales (Crank-Nicolson).
+    """
     if hidden_layers is None:
         hidden_layers = [32, 32, 32]
 
@@ -552,7 +592,7 @@ def main(
     print(f"Buscando α={alpha_true} | Inicialización: α={alpha_init}")
     print("=" * 60)
 
-    # 1. Datos de entrenamiento
+    # 1. Muestreo de datos de entrenamiento aleatorios en el dominio
     np.random.seed(seed)
     x_train_np = np.random.uniform(0.0, L,     num_train_points)
     t_train_np = np.random.uniform(0.0, t_max, num_train_points)
@@ -562,26 +602,27 @@ def main(
     with torch.no_grad():
         u_train_clean = heat_exact(x_train, t_train, alpha=alpha_true, L=L)
 
+    # Introducción de ruido gaussiano
     if noise_std > 0.0:
         torch.manual_seed(seed)
         u_train = u_train_clean + torch.randn_like(u_train_clean) * noise_std
     else:
         u_train = u_train_clean
 
-    # 2. Puntos de condición inicial (t=0)
+    # 2. Generación de las fronteras: Condición inicial (t=0)
     x_ic = torch.linspace(0.0, L, num_ic_points).unsqueeze(1)
     t_ic = torch.zeros(num_ic_points, 1)
 
-    # 3. Puntos de frontera (x=0 y x=L)
+    # 3. Generación de las fronteras: Condiciones de contorno espaciales (x=0, x=L)
     torch.manual_seed(seed)
     t_bc = torch.rand(num_bc_points, 1) * t_max
 
-    # 4. Puntos de colocación
+    # 4. Muestreo del dominio estructural para la evaluación de residuos (física)
     x_col, t_col = sample_collocation_2d(
         0.0, L, 0.0, t_max, num_collocation, sampler=sampler
     )
 
-    # 5. Snapshots de evaluación
+    # 5. Segmentos temporales para evaluación de errores
     t_snap_vals = [0.0, t_max * 0.25, t_max * 0.5, t_max]
 
     shared = dict(
@@ -593,7 +634,7 @@ def main(
         log_freq=log_freq, seed=seed, save_plots=save_plots,
     )
 
-    # 6. Entrenar PINN
+    # 6. Lanzamiento de la red neuronal física (PINN)
     print("\n--- PINN (problema inverso) ---")
     error_pinn, time_pinn, hist_pinn = _train_pinn(
         x_ic=x_ic, t_ic=t_ic, t_bc=t_bc,
@@ -603,11 +644,11 @@ def main(
         **shared,
     )
 
-    # 7. Entrenar NN pura
+    # 7. Lanzamiento del baseline sin regularización física (NN)
     print("\n--- NN pura (sin física, mismos datos) ---")
     error_nn, time_nn, hist_nn = _train_nn(**shared)
 
-    # 8. Referencia numérica: Crank-Nicolson
+    # 8. Resolución estándar por el método de Crank-Nicolson
     print("\n--- Crank-Nicolson (referencia numérica) ---")
     x_np = np.linspace(0.0, L, 300)
     t_np = np.linspace(0.0, t_max, 100)
@@ -624,14 +665,14 @@ def main(
     for t_val in t_snap_vals:
         idx_t     = int(np.argmin(np.abs(t_np - t_val)))
         u_cn_at_t = torch.tensor(sol_cn[idx_t], dtype=torch.float32).unsqueeze(1)
-        x_cn      = torch.tensor(x_np,           dtype=torch.float32).unsqueeze(1)
+        x_cn      = torch.tensor(x_np,          dtype=torch.float32).unsqueeze(1)
         t_cn      = torch.full_like(x_cn, t_val)
         with torch.no_grad():
             u_exact = heat_exact(x_cn, t_cn, alpha=alpha_true, L=L)
         cn_errors.append(calculate_l2_error(u_cn_at_t, u_exact))
     error_cn = float(np.mean(cn_errors))
 
-    # 9. Resultados finales
+    # 9. Recopilación de métricas e impresiones finales
     alpha_final = hist_pinn["alpha_pred"][-1] if hist_pinn["alpha_pred"] else float("nan")
 
     final_results = {
@@ -677,7 +718,7 @@ if __name__ == "__main__":
     SEEDS = [42, 123, 7, 99, 2024, 314, 17, 56, 88, 200] 
 
     # ----------------------------------------------------------------
-    # Configuración BASE
+    # Configuración BASE del experimento
     # ----------------------------------------------------------------
     BASE = dict(
         L=1.0, t_max=1.0,
@@ -699,7 +740,7 @@ if __name__ == "__main__":
     )
 
     # ----------------------------------------------------------------
-    # Todas las configuraciones del estudio de sensibilidad
+    # Matriz de configuraciones para el estudio de sensibilidad
     # ----------------------------------------------------------------
     variaciones = [
         # --- BASE ---

@@ -52,12 +52,42 @@ def _train_model(
     save_plots: bool = True,
 ) -> tuple[float, float, dict, torch.Tensor]:
     """
-    Entrena un modelo (PINN o NN pura) y devuelve error L2, tiempo, historial
-    y predicciones finales. Recibe los datos ya generados para garantizar
-    condiciones idénticas entre métodos.
+    Rutina principal de entrenamiento para los modelos neuronales (PINN o NN estándar) 
+    aplicados al Oscilador Armónico Cuántico 1D.
+    Recibe los tensores pregenerados para garantizar condiciones idénticas de 
+    evaluación y convergencia entre los distintos métodos.
+
+    Args:
+        use_physics (bool): Indica si se debe optimizar el residuo de la ecuación de Schrödinger.
+        estado_n (int): Nivel de energía cuántico (número cuántico principal).
+        x_left (torch.Tensor): Coordenada de la frontera espacial izquierda.
+        x_right (torch.Tensor): Coordenada de la frontera espacial derecha.
+        x_train (torch.Tensor): Puntos de entrenamiento empírico (observaciones).
+        u_train (torch.Tensor): Solución exacta evaluada en los puntos de entrenamiento.
+        x_domain (torch.Tensor): Puntos de colocación para evaluar el residuo físico en el continuo.
+        x_eval (torch.Tensor): Puntos de evaluación continua para métricas de validación.
+        u_true (torch.Tensor): Solución analítica en los puntos de validación.
+        epochs (int): Número total de épocas de optimización.
+        lr (float): Tasa de aprendizaje inicial.
+        use_data (bool): Indica si se incluyen datos empíricos en la función de pérdida.
+        use_dynamic_weights (bool): Habilita la actualización dinámica de los ponderadores de pérdida.
+        use_orthogonality (bool): Fuerza la restricción de ortogonalidad respecto a estados previos.
+        optimizer_name (str): Optimizador seleccionado ('adam', 'lbfgs', o 'adam+lbfgs').
+        hidden_layers (list): Arquitectura topológica del perceptrón multicapa.
+        log_freq (int): Frecuencia de épocas para la impresión del progreso por consola.
+        seed (int): Semilla para garantizar la reproducibilidad estocástica.
+        save_plots (bool, opcional): Habilita el guardado de visualizaciones. Por defecto es True.
+
+    Returns:
+        tuple[float, float, dict, torch.Tensor]: Tupla que empaqueta:
+            - Error relativo L2 final.
+            - Tiempo total de cómputo en segundos.
+            - Diccionario con el historial completo de métricas y pérdidas.
+            - Tensor con las inferencias generadas tras el entrenamiento.
     """
     set_seed(seed)
 
+    # Inicialización del autovalor de energía
     epsilon_init   = 0
     model = PINN(hidden_layers=hidden_layers)
     with torch.no_grad():
@@ -78,13 +108,14 @@ def _train_model(
         "lambda_bound": [],
     }
 
-    # ── Caso degenerado: NN pura sin datos ─────────────────────────────────
+    # --- Caso límite: Modelo empírico sin provisión de datos ---
     if not use_physics and not use_data:
-        print(f"[{label}] Omitida: sin datos ni física no hay nada que optimizar.")
+        print(f"[{label}] Omitida: Modelo sin formulación física ni datos empíricos disponibles.")
         pred_eval = model(x_eval).detach()
         error_l2  = calculate_l2_error(pred_eval, u_true)
         return error_l2, 0.0, historial, pred_eval
 
+    # --- Configuración del motor de optimización ---
     if optimizer_name == "adam":
         optimizer = optim.Adam(model.parameters(), lr=lr)
     elif optimizer_name == "lbfgs":
@@ -94,23 +125,25 @@ def _train_model(
     else:
         raise ValueError(
             f"Optimizador '{optimizer_name}' no reconocido. "
-            f"Usa 'adam', 'lbfgs' o 'adam+lbfgs'."
+            f"Opciones válidas: 'adam', 'lbfgs', 'adam+lbfgs'."
         )
 
+    # Inicialización de ponderadores dinámicos
     lambda_ph    = 1.0
     lambda_bound = 1.0
 
     with Timer() as timer:
         for epoch in range(1, epochs + 1):
 
-            # Cambio de fase Adam → L-BFGS en la mitad del entrenamiento
+            # Transición heurística de Adam a L-BFGS en el ecuador del proceso de entrenamiento
             if optimizer_name == "adam+lbfgs" and epoch == epochs // 2 + 1:
-                print(f"\n[{label}] Cambiando a L-BFGS en época {epoch}\n")
+                print(f"\n[{label}] Transición al optimizador L-BFGS en época {epoch}\n")
                 optimizer = optim.LBFGS(model.parameters(), lr=0.1, max_iter=500)
 
             def closure(lph=lambda_ph, lbound=lambda_bound):
                 optimizer.zero_grad()
 
+                # Evaluación de la pérdida empírica
                 if use_data:
                     data_loss = torch.mean((model(x_train) - u_train) ** 2)
                 else:
@@ -121,6 +154,7 @@ def _train_model(
                 ortho_loss_val = torch.tensor(0.0)
                 norm_loss_val  = torch.tensor(0.0)
 
+                # Evaluación de los componentes de pérdida informados por la física cuántica
                 if use_physics:
                     ph_loss_val    = physics_loss_QHO(model, x_domain)
                     bound_loss_val = boundary_loss(model, x_left, x_right)
@@ -135,6 +169,7 @@ def _train_model(
                             model, x_domain, domain_length=20.0
                         )
 
+                # Ensamblaje de la función de coste global
                 if not use_physics:
                     total = data_loss
                 elif use_data:
@@ -155,12 +190,14 @@ def _train_model(
                 total.backward()
                 return total
 
-            # Paso del optimizador
+            # --- Ejecución del paso de optimización ---
             if optimizer_name == "lbfgs" or (
                 optimizer_name == "adam+lbfgs" and epoch >= epochs // 2 + 1
             ):
                 result     = optimizer.step(closure)
                 total_loss = result if result is not None else torch.tensor(0.0)
+                
+                # Estimación de métricas para el historial
                 with torch.no_grad():
                     data_loss = (
                         torch.mean((model(x_train) - u_train) ** 2)
@@ -198,6 +235,7 @@ def _train_model(
                             model, x_domain, domain_length=20.0
                         )
 
+                # Recalibración dinámica de hiperparámetros de pérdida
                 if use_dynamic_weights and use_data and use_physics:
                     lambda_ph, lambda_bound = update_dynamic_weights(
                         data_loss,
@@ -230,6 +268,7 @@ def _train_model(
                 total_loss.backward()
                 optimizer.step()
 
+            # --- Monitorización y almacenamiento del estado ---
             if epoch % log_freq == 0 or epoch == epochs:
                 print(
                     f"[{label}] Época {epoch:05d} | Pérdida: {total_loss.item():.4e} "
@@ -237,7 +276,7 @@ def _train_model(
                 )
                 if use_dynamic_weights and use_data and use_physics:
                     print(
-                        f"| Pesos -> Física: {lambda_ph:.4f} "
+                        f"| Pesos dinámicos -> Física: {lambda_ph:.4f} "
                         f"| Frontera: {lambda_bound:.4f}"
                     )
 
@@ -290,10 +329,33 @@ def main(
     seed: int = 42,
     save_plots: bool = True,
 ):
+    """
+    Orquesta la ejecución integral de un experimento para el Oscilador Armónico Cuántico (QHO).
+    Sintetiza la generación de datos, el entrenamiento comparativo (PINN vs NN estándar), la 
+    contrastación numérica contra métodos de diferencias finitas (FDM) y el empaquetado final 
+    de los resultados.
+
+    Args:
+        estado_n (int, opcional): Nivel de energía cuántico a resolver. Por defecto es 0.
+        epochs (int, opcional): Iteraciones de optimización del modelo. Por defecto es 5000.
+        lr (float, opcional): Tasa de aprendizaje inicial. Por defecto es 0.001.
+        num_domain_points (int, opcional): Cantidad de puntos de colocación internos. Por defecto es 500.
+        num_train_points (int, opcional): Tamaño de la muestra de datos empíricos. Por defecto es 15.
+        train_region (float, opcional): Fracción del dominio cubierta por observaciones. Por defecto es 0.5.
+        sampler (str, opcional): Algoritmo de discretización de colocación ('lhs' o 'grid'). Por defecto es "lhs".
+        log_freq (int, opcional): Frecuencia de escritura del progreso en consola. Por defecto es 1000.
+        use_data (bool, opcional): Integra la función de coste basada en datos empíricos. Por defecto es True.
+        use_dynamic_weights (bool, opcional): Habilita ponderación adaptativa de los términos de pérdida. Por defecto es False.
+        use_orthogonality (bool, opcional): Incorpora regularización de ortogonalidad cuántica. Por defecto es False.
+        optimizer_name (str, opcional): Motor de búsqueda del gradiente. Por defecto es "adam".
+        hidden_layers (list, opcional): Topología estructural de la red neuronal. Por defecto es [32, 32, 32].
+        seed (int, opcional): Entropía controlada para reproducibilidad. Por defecto es 42.
+        save_plots (bool, opcional): Habilita la serialización gráfica automática. Por defecto es True.
+    """
     if hidden_layers is None:
         hidden_layers = [32, 32, 32]
 
-    # 1. Seed y directorios
+    # --- 1. Configuración de reproducibilidad y sistema de archivos ---
     set_seed(seed)
     os.makedirs("img", exist_ok=True)
     os.makedirs("results", exist_ok=True)
@@ -319,17 +381,17 @@ def main(
     }
 
     print("=" * 60)
-    print(f"QHO — Experimento completo (n={estado_n})")
+    print(f"QHO — Experimento Analítico (Estado n={estado_n})")
     print(
-        f"Sampler: {sampler} | Puntos dominio: {num_domain_points} | "
-        f"Puntos train: {num_train_points} | Región: {train_region} | "
-        f"Épocas: {epochs} | Optimizador: {optimizer_name} | "
-        f"lr: {lr} | Pesos din.: {use_dynamic_weights} | "
-        f"Ortogonalidad: {use_orthogonality} | Seed: {seed}"
+        f"Muestreo: {sampler} | Colocación: {num_domain_points} nodos | "
+        f"Train: {num_train_points} obs | Cobertura: {train_region*100}% | "
+        f"Épocas: {epochs} | Motor Opt.: {optimizer_name} | "
+        f"lr: {lr} | Pesos adaptativos: {use_dynamic_weights} | "
+        f"Ortogonalidad: {use_orthogonality} | Semilla: {seed}"
     )
     print("=" * 60)
 
-    # 2. Datos compartidos — generados UNA sola vez con la seed ya fijada
+    # --- 2. Generación unificada de tensores base compartidos ---
     x_min, x_max = -10.0, 10.0
     x_left, x_right = generate_boundary_points(x_min, x_max)
 
@@ -358,16 +420,16 @@ def main(
         log_freq=log_freq, seed=seed, save_plots=save_plots,
     )
 
-    # 3. Entrenar PINN
-    print("\n--- PINN (con física) ---")
+    # --- 3. Despliegue del Modelo Informado por la Física (PINN) ---
+    print("\n--- Modelado PINN (Regulación Física Activa) ---")
     error_pinn, time_pinn, hist_pinn, pred_pinn = _train_model(use_physics=True, **shared)
 
-    # 4. Entrenar NN pura (omitida automáticamente si use_data=False)
-    print("\n--- NN pura (sin física) ---")
+    # --- 4. Despliegue del Modelo Empírico (NN Estándar) ---
+    print("\n--- Modelado NN Pura (Basado exclusivamente en Datos) ---")
     error_nn, time_nn, hist_nn, pred_nn = _train_model(use_physics=False, **shared)
 
-    # 5. Referencia numérica FDM
-    print("\n--- FDM ---")
+    # --- 5. Resolución de Referencia Numérica (Método de Diferencias Finitas) ---
+    print("\n--- Resolución Discreta Estándar (Método FDM) ---")
     x_np = np.linspace(x_min, x_max, 1000)
     ref  = measure_numerical_reference(
         sistema="qho", x_or_t=x_np, mass=1.0, omega=1.0, hbar=1.0, k=estado_n + 1
@@ -376,7 +438,7 @@ def main(
     epsilon_fdm = eigenvalues_fdm[estado_n]
     psi_fdm     = eigenvectors_fdm[:, estado_n]
 
-    # Corrección de signo
+    # Corrección de la convención de fase (signo) para comparativa analítica L2
     x_eval_np    = x_eval.detach().numpy().flatten()
     u_true_np    = u_true.detach().numpy().flatten()
     fdm_interp   = interp1d(x_np, psi_fdm, kind="cubic")
@@ -388,7 +450,7 @@ def main(
     error_fdm = calculate_l2_error(u_fdm, u_true)
     time_fdm  = ref["time_s"]
 
-    # 6. Gráfica comparativa final
+    # --- 6. Exportación de Perfil Comparativo Final ---
     if save_plots:
         plot_comparison(
             x_eval=x_eval,
@@ -406,7 +468,7 @@ def main(
             estado_n=estado_n,
         )
 
-    # 7. Resultados finales
+    # --- 7. Consolidación Estructural de Resultados ---
     final_results = {
         "pinn": {
             "error_L2":        error_pinn,
@@ -432,14 +494,15 @@ def main(
     }
 
     print(f"\n{'=' * 60}")
-    print(f"RESULTADOS FINALES (QHO | n={estado_n})")
-    print(f"{'Método':<12} {'Error L2':>12} {'Tiempo (s)':>12}")
-    print(f"{'FDM':<12} {error_fdm:>12.4e} {time_fdm:>12.4f}")
-    nn_str = f"{error_nn:>12.4e}" if error_nn is not None else f"{'N/A':>12}"
-    print(f"{'NN pura':<12} {nn_str} {time_nn:>12.2f}")
-    print(f"{'PINN':<12} {error_pinn:>12.4e} {time_pinn:>12.2f}")
+    print(f"RESUMEN DE PRECISIÓN METODOLÓGICA (QHO | Estado n={estado_n})")
+    print(f"{'Metodología':<15} {'Error L2':>15} {'Cómputo (s)':>15}")
+    print(f"{'FDM Discreto':<15} {error_fdm:>15.4e} {time_fdm:>15.4f}")
+    nn_str = f"{error_nn:>15.4e}" if error_nn is not None else f"{'N/A':>15}"
+    print(f"{'NN Estándar':<15} {nn_str} {time_nn:>15.2f}")
+    print(f"{'PINN Analítica':<15} {error_pinn:>15.4e} {time_pinn:>15.2f}")
+    
     epsilon_learned = hist_pinn["epsilon"][-1] if hist_pinn["epsilon"] else float("nan")
-    print(f"\nAutovalor exacto: {exact_epsilon:.4f} | PINN: {epsilon_learned:.4f} | FDM: {float(epsilon_fdm):.4f}")
+    print(f"\nValor Teórico E: {exact_epsilon:.4f} | Convergencia PINN: {epsilon_learned:.4f} | Aproximación FDM: {float(epsilon_fdm):.4f}")
     print("=" * 60)
 
     save_experiment_results(config_exp, final_results, historial_completo)
@@ -449,7 +512,7 @@ if __name__ == "__main__":
     SEEDS = [42, 123, 7, 99, 2024, 314, 17, 56, 88, 200]
 
     # ----------------------------------------------------------------
-    # Configuración BASE  (n=1, train_region=0.5)
+    # Configuración Paramétrica BASE (Estado Fundamental n=1, Región=0.5)
     # ----------------------------------------------------------------
     BASE = dict(
         estado_n=1, 
@@ -462,58 +525,60 @@ if __name__ == "__main__":
         optimizer_name="adam", hidden_layers=[32, 32, 32],
         log_freq=10000, save_plots=False,
     )
+    
     # ----------------------------------------------------------------
-    # Todas las configuraciones del estudio de sensibilidad
+    # Hiperespacio del Estudio de Sensibilidad
+    # Cada diccionario superpone sus valores sobre la configuración BASE
     # ----------------------------------------------------------------
     variaciones = [
-        # --- BASE ---
+        # --- Nodo Control (BASE) ---
         {},
 
-        # --- Eje 1: Puntos de colocación ---
+        # --- Eje 1: Densidad de nodos de colocación espacial ---
         {"num_domain_points": 50},
         {"num_domain_points": 100},
         {"num_domain_points": 250},
         {"num_domain_points": 1000},
 
-        # --- Eje 2: Sampler ---
+        # --- Eje 2: Estrategias de muestreo del dominio ---
         {"sampler": "grid"},
 
-        # --- Eje 3: Optimizador ---
+        # --- Eje 3: Algoritmos de optimización de segundo orden ---
         {"optimizer_name": "adam+lbfgs"},
 
-        # --- Eje 4: Arquitectura ---
+        # --- Eje 4: Capacidad estructural de la red neuronal ---
         {"hidden_layers": [64, 64, 64]},
 
-        # --- Eje 5: Pesos dinámicos ---
+        # --- Eje 5: Mecanismos de regularización dinámica ---
         {"use_dynamic_weights": True},
 
-        # --- Eje 6: Learning rate ---
+        # --- Eje 6: Tasa de aprendizaje (Learning rate) ---
         {"lr": 0.01},
 
-        # --- Eje 7: Puntos de entrenamiento (región 50%) ---
+        # --- Eje 7: Escasez de datos empíricos (Control de región: 50%) ---
         {"num_train_points": 3},
         {"num_train_points": 5},
         {"num_train_points": 10},
         {"num_train_points": 30},
 
-        # --- Eje 8: Región de entrenamiento (15 puntos base) ---
+        # --- Eje 8: Extensión observacional (Retracción al 30% del dominio) ---
         {"train_region": 0.3},
 
-        # --- Eje 9: Cruce puntos × región 0.3 ---
+        # --- Eje 9: Intersección (Escasez vs Retracción observacional) ---
         {"num_train_points": 3,  "train_region": 0.3},
         {"num_train_points": 5,  "train_region": 0.3},
         {"num_train_points": 10, "train_region": 0.3},
         {"num_train_points": 30, "train_region": 0.3},
 
-        # --- Eje 10: Estado cuántico (solo configuración BASE) ---
+        # --- Eje 10: Complejidad Cuántica (Oscilaciones paramétricas) ---
         {"estado_n": 0},
         {"estado_n": 2},
         {"estado_n": 3},
 
-        # --- Eje 11: Sin datos (solo física) ---
+        # --- Eje 11: Descubrimiento Zero-Shot (Regulación física pura) ---
         {"use_data": False},
 
-        # --- Eje 12: Ortogonalidad ---
+        # --- Eje 12: Restricción de Ortogonalidad Activa ---
         {"use_orthogonality": True},
     ]
 
@@ -521,16 +586,16 @@ if __name__ == "__main__":
     total_runs    = total_configs * len(SEEDS)
 
     print(f"\n{'=' * 60}")
-    print(f"ESTUDIO DE SENSIBILIDAD — QHO")
-    print(f"Configuraciones: {total_configs} | Seeds: {len(SEEDS)} | Total ejecuciones: {total_runs}")
+    print(f"ANÁLISIS DE SENSIBILIDAD METODOLÓGICA — Oscilador Armónico Cuántico (QHO)")
+    print(f"Batería experimental: {total_configs} Configuraciones | {len(SEEDS)} Semillas | {total_runs} Ejecuciones totales")
     print(f"{'=' * 60}\n")
 
     for i, variacion in enumerate(variaciones, start=1):
         config = {**BASE, **variacion}
         print(f"\n{'#' * 60}")
-        print(f"Configuración {i}/{total_configs}: {variacion if variacion else 'BASE'}")
+        print(f"Evaluación de Configuración {i}/{total_configs}: {variacion if variacion else 'Modelo BASE'}")
         print(f"{'#' * 60}")
 
         for j, seed in enumerate(SEEDS, start=1):
-            print(f"\n  Seed {j}/{len(SEEDS)}: {seed}")
+            print(f"\n  Instancia Estocástica (Seed) {j}/{len(SEEDS)}: {seed}")
             main(**config, seed=seed)

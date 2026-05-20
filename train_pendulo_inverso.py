@@ -42,8 +42,34 @@ def _train_pinn(
     save_plots: bool = True,
 ) -> tuple[float, float, dict, torch.Tensor]:
     """
-    Entrena la PINN para el problema inverso: descubre g y mu a partir
-    de datos (posiblemente ruidosos) y la ecuación del movimiento.
+    Entrena la Red Neuronal Informada por la Física (PINN) para el problema inverso.
+    El objetivo es descubrir los parámetros físicos (g y mu) a partir de datos 
+    (posiblemente ruidosos) y de la ecuación diferencial del movimiento.
+
+    Args:
+        t_train: Tensor con los instantes de tiempo de entrenamiento.
+        u_train: Tensor con las observaciones del estado en t_train.
+        t_domain: Tensor con los puntos de colocación en todo el dominio temporal.
+        t_eval: Tensor con los instantes de tiempo para evaluación (referencia).
+        u_true: Tensor con la solución real en t_eval para calcular el error L2.
+        L: Longitud del péndulo.
+        g_true: Valor real de la gravedad (usado solo para métricas).
+        mu_true: Valor real del coeficiente de amortiguamiento (usado solo para métricas).
+        epochs: Número total de épocas de entrenamiento.
+        lr: Tasa de aprendizaje inicial.
+        use_dynamic_weights: Booleano para activar el pesaje dinámico en la función de pérdida.
+        optimizer_name: Tipo de optimizador ('adam', 'lbfgs', o 'adam+lbfgs').
+        hidden_layers: Lista con la arquitectura de capas ocultas de la red.
+        log_freq: Frecuencia de impresión y registro de métricas.
+        seed: Semilla para reproducibilidad.
+        save_plots: Booleano para guardar las gráficas generadas.
+
+    Returns:
+        Una tupla que contiene:
+        - error_l2: Error L2 final respecto a la solución de referencia.
+        - elapsed_time: Tiempo total de entrenamiento en segundos.
+        - historial: Diccionario con la evolución de métricas y parámetros por época.
+        - pred_eval: Tensor con las predicciones del modelo en el dominio de evaluación.
     """
     set_seed(seed)
     model = PINNDampedPendulum(hidden_layers=hidden_layers)
@@ -59,6 +85,7 @@ def _train_pinn(
         "lambda_ph":  [],
     }
 
+    # Configuración del optimizador según la selección
     if optimizer_name == "adam":
         optimizer = optim.Adam([
             {"params": model.net.parameters(), "lr": lr},
@@ -82,6 +109,7 @@ def _train_pinn(
     with Timer() as timer:
         for epoch in range(1, epochs + 1):
 
+            # Transición a L-BFGS si se utiliza la estrategia combinada
             if optimizer_name == "adam+lbfgs" and epoch == int(epochs * 0.85) + 1:
                 print(f"\n[{label}] Cambiando a L-BFGS en época {epoch}\n")
                 optimizer = optim.LBFGS(model.parameters(), lr=0.01, max_iter=50)
@@ -94,6 +122,7 @@ def _train_pinn(
                 total.backward()
                 return total
 
+            # Ejecución del paso de optimización dependiendo del algoritmo activo
             if optimizer_name == "lbfgs" or (
                 optimizer_name == "adam+lbfgs" and epoch >= int(epochs * 0.85) + 1
             ):
@@ -118,10 +147,12 @@ def _train_pinn(
 
                 total_loss = data_loss + lambda_ph * ph_loss_val
                 total_loss.backward()
-                # Gradient clipping para evitar explosiones antes de entrar en L-BFGS
+                
+                # Gradient clipping para prevenir explosión de gradientes antes de L-BFGS
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
 
+            # Registro y visualización periódica del estado del entrenamiento
             if epoch % log_freq == 0 or epoch == epochs:
                 g_pred  = model.g.item()
                 mu_pred = model.mu.item()
@@ -168,9 +199,29 @@ def _train_nn(
     save_plots: bool = True,
 ) -> tuple[float, float, dict, torch.Tensor]:
     """
-    Entrena una NN pura (sin física) con los mismos datos ruidosos.
-    No conoce g ni mu — solo ajusta los datos.
-    Sirve como baseline para comparar con la PINN.
+    Entrena una Red Neuronal pura (sin regularización física) con los mismos 
+    datos de entrenamiento. Sirve como modelo 'baseline' para evaluar la ventaja 
+    de introducir el conocimiento físico.
+
+    Args:
+        t_train: Tensor con los instantes de tiempo de entrenamiento.
+        u_train: Tensor con las observaciones del estado en t_train.
+        t_eval: Tensor con los instantes de tiempo para evaluación.
+        u_true: Tensor con la solución real en t_eval.
+        epochs: Número total de épocas de entrenamiento.
+        lr: Tasa de aprendizaje inicial.
+        optimizer_name: Tipo de optimizador ('adam', 'lbfgs', o 'adam+lbfgs').
+        hidden_layers: Lista con la arquitectura de capas ocultas de la red.
+        log_freq: Frecuencia de impresión de métricas.
+        seed: Semilla para reproducibilidad.
+        save_plots: Booleano para guardar las gráficas generadas.
+
+    Returns:
+        Una tupla que contiene:
+        - error_l2: Error L2 final respecto a la solución de referencia.
+        - elapsed_time: Tiempo total de entrenamiento en segundos.
+        - historial: Diccionario con la evolución de métricas por época.
+        - pred_eval: Tensor con las predicciones del modelo puro en evaluación.
     """
     set_seed(seed)
     model = PINNDampedPendulum(hidden_layers=hidden_layers)
@@ -257,10 +308,16 @@ def main(
     seed: int = 42,
     save_plots: bool = True,
 ):
+    """
+    Controlador principal que orquesta el experimento para el péndulo amortiguado.
+    Genera los datos de referencia numéricos (RK4), prepara los tensores de 
+    entrenamiento con ruido añadido, entrena tanto la PINN como la NN baseline,
+    y guarda los resultados y métricas comparativas.
+    """
     if hidden_layers is None:
         hidden_layers = [32, 32, 32, 32, 32]
 
-    # 1. Seed y directorios
+    # 1. Configuración de semillas y creación de directorios de salida
     set_seed(seed)
     os.makedirs("img", exist_ok=True)
     os.makedirs("results", exist_ok=True)
@@ -298,7 +355,7 @@ def main(
     print(f"Buscando g={g_true} y mu={mu_true}")
     print("=" * 60)
 
-    # 2. Ground truth con RK4
+    # 2. Generación del 'ground truth' utilizando integración numérica (RK4)
     t_rk4 = np.linspace(0.0, t_max, 1000)
     ref_rk4 = measure_numerical_reference(
         sistema="pendulo_inverso",
@@ -310,7 +367,7 @@ def main(
     t_eval = torch.tensor(t_rk4, dtype=torch.float32).unsqueeze(1)
     u_true = torch.tensor(theta_rk4, dtype=torch.float32).unsqueeze(1)
 
-    # 3. Datos de entrenamiento (ground truth + ruido, hasta train_region)
+    # 3. Preparación de los datos de entrenamiento con ruido (hasta límite de train_region)
     t_train_end = t_max * train_region
     idx_all     = np.where(t_rk4 <= t_train_end)[0]
     idx_train   = idx_all[
@@ -327,13 +384,13 @@ def main(
     t_train = torch.tensor(t_train_np,        dtype=torch.float32).unsqueeze(1)
     u_train = torch.tensor(theta_train_noisy, dtype=torch.float32).unsqueeze(1)
 
-    # 4. Puntos de colocación (todo el dominio temporal)
+    # 4. Generación de los puntos de colocación en todo el dominio temporal
     if sampler == "lhs":
         t_domain = generate_lhs_points(0.0, t_max, num_domain_points)
     else:
         t_domain = generate_grid_points(0.0, t_max, num_domain_points)
 
-    # 5. Entrenar PINN (descubre g y mu)
+    # 5. Ejecución del entrenamiento: PINN (descubrimiento de g y mu)
     print("\n--- PINN (problema inverso) ---")
     error_pinn, time_pinn, hist_pinn, pred_pinn = _train_pinn(
         t_train=t_train, u_train=u_train,
@@ -345,7 +402,7 @@ def main(
         log_freq=log_freq, seed=seed, save_plots=save_plots,
     )
 
-    # 6. Entrenar NN pura (mismos datos ruidosos, sin física)
+    # 6. Ejecución del entrenamiento: NN pura (referencia sin física)
     print("\n--- NN pura (sin física, mismos datos) ---")
     error_nn, time_nn, hist_nn, pred_nn = _train_nn(
         t_train=t_train, u_train=u_train,
@@ -355,11 +412,11 @@ def main(
         log_freq=log_freq, seed=seed, save_plots=save_plots,
     )
 
-    # 7. RK4 ya calculado
+    # 7. Obtención de tiempos de cálculo de la referencia RK4
     print("\n--- RK4 (referencia numérica) ---")
     time_rk4 = ref_rk4["time_s"]
 
-    # 8. Gráfica comparativa final
+    # 8. Generación de la gráfica comparativa final del experimento
     if save_plots:
         plot_comparison(
             x_eval=t_eval,
@@ -377,7 +434,7 @@ def main(
             estado_n=0,
         )
 
-    # 9. Resultados finales
+    # 9. Consolidación y visualización de resultados finales
     g_final  = hist_pinn["g_pred"][-1]  if hist_pinn["g_pred"]  else float("nan")
     mu_final = hist_pinn["mu_pred"][-1] if hist_pinn["mu_pred"] else float("nan")
 
@@ -428,7 +485,7 @@ if __name__ == "__main__":
     SEEDS = [42, 123, 7, 99, 2024, 314, 17, 56, 88, 200]
 
     # ----------------------------------------------------------------
-    # Configuración BASE
+    # Configuración BASE del experimento
     # ----------------------------------------------------------------
     BASE = dict(
         t_max=20.0, L=1.0,
@@ -450,7 +507,7 @@ if __name__ == "__main__":
     )
 
     # ----------------------------------------------------------------
-    # Todas las configuraciones del estudio de sensibilidad
+    # Matriz de configuraciones para el estudio de sensibilidad
     # ----------------------------------------------------------------
     variaciones = [
         # --- BASE ---
@@ -507,14 +564,10 @@ if __name__ == "__main__":
 
     for i, variacion in enumerate(variaciones, start=1):
         config = {**BASE, **variacion}
-        if i < 13:  # saltar configuraciones ya ejecutadas
-            continue
         print(f"\n{'#' * 60}")
         print(f"Configuración {i}/{total_configs}: {variacion if variacion else 'BASE'}")
         print(f"{'#' * 60}")
 
         for j, seed in enumerate(SEEDS, start=1):
-            if i == 13 and j <= 4:  # saltar seeds ya ejecutadas de la config 13
-                continue
             print(f"\n  Seed {j}/{len(SEEDS)}: {seed}")
             main(**config, seed=seed)
